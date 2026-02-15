@@ -1,5 +1,7 @@
 # FlowForge TUI
 
+![FlowForge TUI Screenshot](assets/Screenshot.png)
+
 FlowForge TUI is a terminal task manager for running a multi-agent pipeline from `tasks.jsonl`.
 
 It solves two core problems:
