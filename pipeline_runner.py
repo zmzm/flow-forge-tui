@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 import threading
 from dataclasses import dataclass
@@ -44,12 +45,16 @@ def _require_env(name: str) -> str:
 
 PROJECT_DIR = Path(_require_env("PROJECT_DIR")).expanduser()
 TASKS_FILE = Path(_require_env("TASKS_FILE")).expanduser()
+STEPS_FILE = TASKS_FILE.with_name("steps.json")
 RUNS_DIR = Path("runs").expanduser()
 
-AGENT_CONCEPT = "concept-plan"
-AGENT_GROUNDED = "grounded-hard"
-AGENT_EXECUTE = "execution-plan"
-DEFAULT_PIPELINE_STEPS = ["concept", "grounded", "execution"]
+DEFAULT_STEP_CONFIGS = [
+    {"id": "concept", "label": "Business plan", "agent": "concept-plan"},
+    {"id": "grounded", "label": "Technical plan", "agent": "grounded-hard"},
+    {"id": "execution", "label": "Execution", "agent": "execution-plan"},
+]
+SUPPORTED_STEP_IDS = {step["id"] for step in DEFAULT_STEP_CONFIGS}
+STEP_ID_RE = re.compile(r"^[A-Za-z0-9_-]+$")
 
 MODEL: Optional[str] = _require_env("MODEL")
 VARIANT: Optional[str] = None
@@ -114,6 +119,179 @@ def write_tasks_jsonl(path: Path, tasks: List[Dict[str, Any]]) -> None:
     )
 
 
+def normalize_step_configs(raw_steps: Any, source: str = "steps config") -> List[Dict[str, Any]]:
+    if not isinstance(raw_steps, list) or not raw_steps:
+        raise ValueError(f"{source} must contain a non-empty 'steps' list")
+
+    configs: List[Dict[str, Any]] = []
+    seen = set()
+    defaults = {step["id"]: step for step in DEFAULT_STEP_CONFIGS}
+    for index, raw_step in enumerate(raw_steps, 1):
+        if isinstance(raw_step, str):
+            step_id = raw_step.strip()
+            default = defaults.get(step_id, {})
+            label = str(default.get("label") or step_id)
+            agent = str(default.get("agent") or "").strip()
+        elif isinstance(raw_step, dict):
+            step_id = str(raw_step.get("id", "")).strip()
+            default = defaults.get(step_id, {})
+            label = str(raw_step.get("label") or default.get("label") or step_id).strip()
+            agent = str(raw_step.get("agent") or default.get("agent") or "").strip()
+            model = str(raw_step.get("model") or default.get("model") or "").strip()
+            extra_agents = raw_step.get("agents", [])
+        else:
+            raise ValueError(f"Invalid step config at index {index} in {source}")
+        if isinstance(raw_step, str):
+            extra_agents = []
+            model = ""
+
+        if not step_id:
+            raise ValueError(f"Step id cannot be empty at index {index} in {source}")
+        if not STEP_ID_RE.fullmatch(step_id):
+            raise ValueError(f"Step id '{step_id}' in {source} must use only letters, numbers, '_' or '-'")
+        if step_id in seen:
+            raise ValueError(f"Duplicate step id '{step_id}' in {source}")
+        if not label:
+            raise ValueError(f"Step label cannot be empty for '{step_id}' in {source}")
+        if not agent:
+            raise ValueError(f"Step agent cannot be empty for '{step_id}' in {source}")
+        if not isinstance(extra_agents, list):
+            raise ValueError(f"Step agents must be a list for '{step_id}' in {source}")
+
+        agents = sorted({str(item).strip() for item in extra_agents if str(item).strip()} - {agent})
+        config = {"id": step_id, "label": label, "agent": agent}
+        if model:
+            config["model"] = model
+        if agents:
+            config["agents"] = agents
+        configs.append(config)
+        seen.add(step_id)
+
+    return configs
+
+
+def read_step_configs(path: Path = STEPS_FILE) -> List[Dict[str, Any]]:
+    if not path.exists():
+        return [dict(step) for step in DEFAULT_STEP_CONFIGS]
+
+    raw = json.loads(path.read_text(encoding="utf-8"))
+    raw_steps = raw.get("steps") if isinstance(raw, dict) else raw
+    return normalize_step_configs(raw_steps, str(path))
+
+
+def write_step_configs(step_configs: List[Dict[str, Any]], path: Path = STEPS_FILE) -> None:
+    serializable = []
+    for step in step_configs:
+        item = {
+            "id": str(step["id"]),
+            "label": str(step["label"]),
+            "agent": str(step["agent"]),
+        }
+        model = str(step.get("model") or "").strip()
+        if model:
+            item["model"] = model
+        agents = sorted({str(agent).strip() for agent in step.get("agents", []) if str(agent).strip()} - {item["agent"]})
+        if agents:
+            item["agents"] = agents
+        serializable.append(item)
+    path.write_text(json.dumps({"steps": serializable}, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+
+def step_known_agents(step: Dict[str, Any]) -> List[str]:
+    agents = {str(step["agent"])}
+    agents.update(str(agent).strip() for agent in step.get("agents", []) if str(agent).strip())
+    return sorted(agents)
+
+
+def unknown_task_agents(
+    task: Dict[str, Any],
+    step_configs: Optional[List[Dict[str, Any]]] = None,
+) -> List[Dict[str, str]]:
+    configs = step_configs if step_configs is not None else read_step_configs()
+    agents = task_agents(task, configs)
+    unknown: List[Dict[str, str]] = []
+    for step in configs:
+        step_id = step["id"]
+        agent = agents[step_id]
+        if agent not in step_known_agents(step):
+            unknown.append({"step_id": step_id, "label": step["label"], "agent": agent})
+    return unknown
+
+
+def add_known_step_agents(
+    additions: List[Dict[str, str]],
+    path: Path = STEPS_FILE,
+) -> List[Dict[str, Any]]:
+    configs = read_step_configs(path)
+    by_id = {step["id"]: step for step in configs}
+    for addition in additions:
+        step = by_id.get(addition["step_id"])
+        if not step:
+            continue
+        agent = str(addition["agent"]).strip()
+        if not agent or agent == step["agent"]:
+            continue
+        agents = set(step.get("agents", []))
+        agents.add(agent)
+        step["agents"] = sorted(agents)
+    write_step_configs(configs, path)
+    return configs
+
+
+def pipeline_step_ids(step_configs: Optional[List[Dict[str, Any]]] = None) -> List[str]:
+    configs = step_configs if step_configs is not None else read_step_configs()
+    return [step["id"] for step in configs]
+
+
+def task_agents(task: Dict[str, Any], step_configs: Optional[List[Dict[str, Any]]] = None) -> Dict[str, str]:
+    overrides = task.get("agents") or {}
+    if not isinstance(overrides, dict):
+        raise ValueError("Task field 'agents' must be an object if provided")
+    return {
+        step["id"]: str(overrides.get(step["id"]) or step["agent"])
+        for step in (step_configs if step_configs is not None else read_step_configs())
+    }
+
+
+def task_run_step_ids(task: Dict[str, Any]) -> Optional[List[str]]:
+    raw_steps = task.get("run_steps")
+    if raw_steps is None:
+        return None
+    if isinstance(raw_steps, str):
+        steps = [item.strip() for item in raw_steps.split(",") if item.strip()]
+    elif isinstance(raw_steps, list):
+        steps = [str(item).strip() for item in raw_steps if str(item).strip()]
+    else:
+        raise ValueError("Task field 'run_steps' must be a list or comma-separated string if provided")
+    if not steps:
+        return None
+    duplicates = sorted({step_id for step_id in steps if steps.count(step_id) > 1})
+    if duplicates:
+        raise ValueError(f"Duplicate run_steps: {duplicates}")
+    return steps
+
+
+def select_steps_for_task(task: Dict[str, Any], steps: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], str]:
+    requested_ids = task_run_step_ids(task)
+    if requested_ids:
+        by_id = {str(step["id"]): step for step in steps}
+        unknown = [step_id for step_id in requested_ids if step_id not in by_id]
+        if unknown:
+            allowed = ", ".join(str(step["id"]) for step in steps)
+            raise ValueError(f"Unknown run_steps: {unknown}. Allowed: {allowed}")
+        return [by_id[step_id] for step_id in requested_ids], "explicit"
+
+    if str(task.get("status", "todo")) != "failed":
+        return steps, "full"
+
+    for index, step in enumerate(steps):
+        output_file: Path = step["output_file"]
+        if not output_file.exists():
+            return steps[index:], "resume"
+
+    return [], "already_complete"
+
+
 def find_next_todo(tasks: List[Dict[str, Any]]) -> Optional[int]:
     for i, t in enumerate(tasks):
         if t.get("status", "todo") == "todo":
@@ -140,12 +318,13 @@ def require_exists(p: Path, err_msg: str) -> None:
         raise FileNotFoundError(f"{err_msg}: {p}")
 
 
-def build_cmd_base(files: List[Path]) -> List[str]:
+def build_cmd_base(files: List[Path], model: Optional[str] = None) -> List[str]:
     cmd = ["opencode", "run", "--format", "json"]
+    effective_model = model or MODEL
     if USE_ATTACH:
         cmd += ["--attach", ATTACH_URL]
-    if MODEL:
-        cmd += ["--model", MODEL]
+    if effective_model:
+        cmd += ["--model", effective_model]
     if VARIANT:
         cmd += ["--variant", VARIANT]
     if SHARE_SESSION:
@@ -184,6 +363,51 @@ def parse_session_id_from_json_events(output: str) -> Optional[str]:
     return None
 
 
+def step_output_file(step_id: str, task_dir: Path) -> Path:
+    fixed_names = {
+        "concept": "concept-plan.md",
+        "grounded": "grounded-plan.md",
+        "execution": "execution.md",
+    }
+    return task_dir / fixed_names.get(step_id, f"{step_id}.md")
+
+
+def step_message(step_id: str, label: str, output_file: Path) -> str:
+    output_name = output_file.name
+    if step_id == "concept":
+        return (
+            "Read the attached task file and produce a CONCEPT PLAN.\n"
+            "Hard requirements:\n"
+            f"- Save your output ONLY to a file named '{output_name}' in the SAME DIRECTORY as the task file.\n"
+            f"After writing the file, briefly confirm that '{output_name}' was created."
+        )
+    if step_id == "grounded":
+        return (
+            "Read ONLY the attached previous plan and produce a GROUNDED PLAN.\n"
+            "Hard requirements:\n"
+            f"- Save your output ONLY to '{output_name}' in the SAME DIRECTORY as the previous plan.\n"
+            f"After writing the file, briefly confirm that '{output_name}' was created."
+        )
+    if step_id == "execution":
+        return (
+            "Read ONLY the attached previous plan and execute it in the repository.\n"
+            "Hard requirements:\n"
+            f"- At the end, save a concise execution report ONLY to '{output_name}' in the SAME DIRECTORY as the previous plan.\n"
+            "The execution report must include:\n"
+            "- What files were changed (paths)\n"
+            "- What endpoints/DTOs were added or updated\n"
+            "- How to verify manually (curl/examples)\n"
+            "- Any follow-ups or known limitations\n"
+            f"After writing the file, briefly confirm that '{output_name}' was created."
+        )
+    return (
+        f"Read ONLY the attached input and produce this pipeline step: {label}.\n"
+        "Hard requirements:\n"
+        f"- Save your output ONLY to '{output_name}' in the SAME DIRECTORY as the attached input.\n"
+        f"After writing the file, briefly confirm that '{output_name}' was created."
+    )
+
+
 def build_pipeline_steps(
     *,
     task: Dict[str, Any],
@@ -192,70 +416,33 @@ def build_pipeline_steps(
     grounded_plan_file: Path,
     execution_file: Path,
 ) -> List[Dict[str, Any]]:
-    allowed = {"concept", "grounded", "execution"}
-    requested_steps = task.get("steps") or DEFAULT_PIPELINE_STEPS
-    if not isinstance(requested_steps, list) or not requested_steps:
-        raise ValueError("Task field 'steps' must be a non-empty list if provided")
-    unknown = [s for s in requested_steps if s not in allowed]
-    if unknown:
-        raise ValueError(f"Unknown step(s) in 'steps': {unknown}. Allowed: {sorted(allowed)}")
-
-    agents_override = task.get("agents") or {}
-    if not isinstance(agents_override, dict):
-        raise ValueError("Task field 'agents' must be an object if provided")
-    labels_override = task.get("step_labels") or {}
-    if not isinstance(labels_override, dict):
-        raise ValueError("Task field 'step_labels' must be an object if provided")
-
-    step_defs: Dict[str, Dict[str, Any]] = {
-        "concept": {
-            "label": str(labels_override.get("concept") or "Concept plan"),
-            "agent": str(agents_override.get("concept") or AGENT_CONCEPT),
-            "input_file": task_file,
-            "output_file": concept_plan_file,
-            "message": (
-                "Read the attached task file and produce a CONCEPT PLAN.\n"
-                "Hard requirements:\n"
-                "- Save your output ONLY to a file named 'concept-plan.md' in the SAME DIRECTORY as the task file.\n"
-                "After writing the file, briefly confirm that 'concept-plan.md' was created."
-            ),
-        },
-        "grounded": {
-            "label": str(labels_override.get("grounded") or "Grounded plan"),
-            "agent": str(agents_override.get("grounded") or AGENT_GROUNDED),
-            "input_file": concept_plan_file,
-            "output_file": grounded_plan_file,
-            "message": (
-                "Read ONLY the attached concept plan and produce a GROUNDED PLAN.\n"
-                "Hard requirements:\n"
-                "- Save your output ONLY to 'grounded-plan.md' in the SAME DIRECTORY as the concept plan.\n"
-                "After writing the file, briefly confirm that 'grounded-plan.md' was created."
-            ),
-        },
-        "execution": {
-            "label": str(labels_override.get("execution") or "Execution"),
-            "agent": str(agents_override.get("execution") or AGENT_EXECUTE),
-            "input_file": grounded_plan_file,
-            "output_file": execution_file,
-            "message": (
-                "Read ONLY the attached grounded plan and execute it in the repository.\n"
-                "Hard requirements:\n"
-                "- At the end, save a concise execution report ONLY to 'execution.md' in the SAME DIRECTORY as the grounded plan.\n"
-                "The execution report must include:\n"
-                "- What files were changed (paths)\n"
-                "- What endpoints/DTOs were added or updated\n"
-                "- How to verify manually (curl/examples)\n"
-                "- Any follow-ups or known limitations\n"
-                "After writing the file, briefly confirm that 'execution.md' was created."
-            ),
-        },
-    }
-    return [{"id": s, **step_defs[s]} for s in requested_steps]
+    step_configs = read_step_configs()
+    agents = task_agents(task, step_configs)
+    task_dir = task_file.parent
+    input_file = task_file
+    steps: List[Dict[str, Any]] = []
+    for step in step_configs:
+        step_id = step["id"]
+        output_file = step_output_file(step_id, task_dir)
+        steps.append(
+            {
+                "id": step_id,
+                "label": step["label"],
+                "agent": agents[step_id],
+                "model": step.get("model") or MODEL,
+                "input_file": input_file,
+                "output_file": output_file,
+                "message": step_message(step_id, step["label"], output_file),
+            }
+        )
+        input_file = output_file
+    return steps
 
 
 def run_opencode_step_stream(
     *,
     agent: str,
+    model: Optional[str],
     message: str,
     files: List[Path],
     cwd: Path,
@@ -265,7 +452,7 @@ def run_opencode_step_stream(
     title: Optional[str] = None,
     session_id: Optional[str] = None,
 ) -> Tuple[int, str, Optional[str]]:
-    cmd = build_cmd_base(files) + ["--agent", agent]
+    cmd = build_cmd_base(files, model=model) + ["--agent", agent]
     if title:
         cmd += ["--title", title]
     if session_id:
@@ -348,13 +535,14 @@ def run_selected_task(
     concept_plan_file = task_dir / "concept-plan.md"
     grounded_plan_file = task_dir / "grounded-plan.md"
     execution_file = task_dir / "execution.md"
-    steps = build_pipeline_steps(
+    all_steps = build_pipeline_steps(
         task=task,
         task_file=task_file,
         concept_plan_file=concept_plan_file,
         grounded_plan_file=grounded_plan_file,
         execution_file=execution_file,
     )
+    steps, run_mode = select_steps_for_task(task, all_steps)
 
     run_id = f'{datetime.now().strftime("%Y%m%d_%H%M%S")}_{selected_id}'
     log_path = RUNS_DIR / f"{run_id}.log"
@@ -368,12 +556,25 @@ def run_selected_task(
             "task_id": selected_id,
             "model": MODEL,
             "steps_total": len(steps),
+            "run_mode": run_mode,
             "log_path": str(log_path),
         },
     )
 
     ok = True
     if not steps:
+        if run_mode == "already_complete":
+            log_path.write_text(
+                f"Task {selected_id} already has outputs for all configured steps; nothing to run.\n",
+                encoding="utf-8",
+            )
+            task["status"] = "done"
+            task["last_run_log"] = str(log_path)
+            task["outputs"] = {str(step["id"]): str(step["output_file"]) for step in all_steps}
+            tasks[idx] = task
+            write_tasks_jsonl(TASKS_FILE, tasks)
+            emit(callback, {"kind": "run_done", "ok": True, "task_id": selected_id, "session_id": session_id})
+            return RunResult(True, selected_id, session_id, log_path, f"Task {selected_id} -> already complete")
         ok = False
         emit(callback, {"kind": "error", "text": "No steps selected"})
 
@@ -389,6 +590,7 @@ def run_selected_task(
         input_file: Path = step["input_file"]
         output_file: Path = step["output_file"]
         agent = str(step["agent"])
+        model = str(step.get("model") or MODEL or "")
 
         emit(
             callback,
@@ -397,6 +599,7 @@ def run_selected_task(
                 "index": step_index,
                 "label": label,
                 "agent": agent,
+                "model": model,
                 "total": len(steps),
             },
         )
@@ -408,6 +611,7 @@ def run_selected_task(
 
         rc, _out, sid = run_opencode_step_stream(
             agent=agent,
+            model=model,
             message=str(step["message"]),
             files=[input_file],
             cwd=PROJECT_DIR,
@@ -450,7 +654,9 @@ def run_selected_task(
     task["status"] = "done"
     task["session_id"] = session_id
     task["last_run_log"] = str(log_path)
-    task["outputs"] = {str(step["id"]): str(step["output_file"]) for step in steps}
+    outputs = task.get("outputs") if isinstance(task.get("outputs"), dict) else {}
+    outputs.update({str(step["id"]): str(step["output_file"]) for step in steps})
+    task["outputs"] = outputs
     tasks[idx] = task
     write_tasks_jsonl(TASKS_FILE, tasks)
     emit(callback, {"kind": "run_done", "ok": True, "task_id": selected_id, "session_id": session_id})
