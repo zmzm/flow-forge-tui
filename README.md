@@ -41,11 +41,10 @@ pip install textual rich
 
 ## Configuration (Environment Variables)
 
-Runtime paths/model are required via environment variables:
+Runtime paths are required via environment variables:
 
 - `PROJECT_DIR` — target repository path where tasks are executed
 - `TASKS_FILE` — path to the `tasks.jsonl` file
-- `MODEL` — model passed to `opencode run --model`
 
 There is no fallback anymore: all three variables must be set (via shell env or `.env`).
 
@@ -54,7 +53,6 @@ Example:
 ```bash
 export PROJECT_DIR="/path/to/project"
 export TASKS_FILE="/path/to/tasks.jsonl"
-export MODEL="model-name"
 python3 tasks-ui.py
 ```
 
@@ -133,7 +131,7 @@ Pipeline steps and labels are configured in `steps.json`, not in task-level fiel
 }
 ```
 
-If a task omits `agents`, the agents from `steps.json` are used. A task can still override agents for a specific run by setting its own `agents` object. `model` is optional per step; when it is omitted or empty, the runner uses the default `MODEL` from `.env`.
+If a task omits `agents`, the agents from `steps.json` are used. A task can still override agents for a specific run by setting its own `agents` object. `model` is optional per step. When omitted, the runner does not pass `--model`, so OpenCode uses the model declared by the selected agent (or its own default). Setting `model` on a step explicitly overrides the agent model.
 
 The UI task editor uses one comma-separated agents input in the same order as `steps.json`, plus a `Run steps` input. Leave `Run steps` empty to run all steps or auto-resume failed tasks. If an entered agent is not known for its step, the UI asks whether to add it to that step in `steps.json` before saving. Added agents are stored in an optional per-step `agents` list:
 

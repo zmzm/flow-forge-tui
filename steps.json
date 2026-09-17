@@ -8,8 +8,7 @@
     {
       "id": "grounded",
       "label": "Technical plan",
-      "agent": "grounded-hard",
-      "model": "zai-coding-plan/glm-5.1"
+      "agent": "grounded-hard"
     },
     {
       "id": "execution",

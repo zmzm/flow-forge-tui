@@ -21,6 +21,81 @@ from textual.widgets import Button, DataTable, Footer, Header, Input, RichLog, S
 
 TASKS_FILE = runner.TASKS_FILE
 FILTERS = ["all", "todo", "failed", "done"]
+EVENT_TEXT_LIMIT = 2_000
+TOOL_PREVIEW_LIMIT = 400
+HIDDEN_TOOL_FIELDS = {"content", "text", "patch", "oldString", "newString", "old_string", "new_string"}
+
+
+def _event_text(value: Any, limit: int = EVENT_TEXT_LIMIT) -> str:
+    if isinstance(value, str):
+        text = value.strip()
+    else:
+        try:
+            text = json.dumps(value, ensure_ascii=False, indent=2, default=str)
+        except Exception:
+            text = str(value)
+    if len(text) <= limit:
+        return text
+    omitted = len(text) - limit
+    return f"{text[:limit]}\n… [{omitted} characters omitted; full event is in the run log]"
+
+
+def _opencode_error_text(event: Dict[str, Any]) -> str:
+    error = event.get("error")
+    if not isinstance(error, dict):
+        return _event_text(error or event)
+    data = error.get("data")
+    data = data if isinstance(data, dict) else {}
+    name = str(error.get("name") or "OpenCode error")
+    message = str(data.get("message") or error.get("message") or "").strip()
+    reference = str(data.get("ref") or error.get("ref") or "").strip()
+    text = f"{name}: {message}" if message else name
+    if reference:
+        text += f"\nreference: {reference}"
+    extra = {key: value for key, value in data.items() if key not in {"message", "ref"}}
+    if extra:
+        text += "\n" + _event_text(extra)
+    return text
+
+
+def _compact_tool_value(value: Any) -> Any:
+    """Remove large payloads while retaining useful tool-call context."""
+    if isinstance(value, dict):
+        compact: Dict[str, Any] = {}
+        for key, item in value.items():
+            if key in HIDDEN_TOOL_FIELDS:
+                size = len(item) if isinstance(item, (str, list, dict)) else None
+                compact[key] = f"<{size} chars/items omitted>" if size is not None else "<omitted>"
+            else:
+                compact[key] = _compact_tool_value(item)
+        return compact
+    if isinstance(value, list):
+        preview = [_compact_tool_value(item) for item in value[:5]]
+        if len(value) > 5:
+            preview.append(f"<{len(value) - 5} more items>")
+        return preview
+    if isinstance(value, str) and len(value) > TOOL_PREVIEW_LIMIT:
+        return f"{value[:TOOL_PREVIEW_LIMIT]}… <{len(value) - TOOL_PREVIEW_LIMIT} chars omitted>"
+    return value
+
+
+def _tool_preview(value: Any) -> str:
+    compact = _compact_tool_value(value)
+    text = _event_text(compact, TOOL_PREVIEW_LIMIT)
+    return " ".join(line.strip() for line in text.splitlines() if line.strip())
+
+
+def _token_summary(tokens: Any) -> str:
+    if not isinstance(tokens, dict):
+        return _tool_preview(tokens)
+    parts = []
+    for key in ("total", "input", "output", "reasoning"):
+        if key in tokens:
+            parts.append(f"{key}={tokens[key]}")
+    cache = tokens.get("cache")
+    if isinstance(cache, dict) and cache.get("read"):
+        parts.append(f"cache_read={cache['read']}")
+    return " ".join(parts)
 
 
 def steps_config_text(step_configs: List[Dict[str, Any]]) -> str:
@@ -466,7 +541,7 @@ class TasksUI(App):
         self.runner_active = False
         self.running_task_id: Optional[str] = None
         self.run_control: Optional[runner.RunControl] = None
-        self.current_model = runner.MODEL or "default"
+        self.current_model = "per-agent"
         self.current_agent = "-"
         self.current_step = "-"
         self.current_session = "-"
@@ -697,10 +772,15 @@ class TasksUI(App):
             total = int(event.get("total", 0))
             self.current_step = f"{index}/{total}"
             self.current_agent = str(event.get("agent") or "-")
-            self.current_model = str(event.get("model") or runner.MODEL or "default")
+            self.current_model = str(event.get("model") or "OpenCode default")
+            model_source = str(event.get("model_source") or "OpenCode")
             self._update_events_header()
             self._push_event(
                 f"[green]STEP[/green] {escape(str(event.get('label', '-')))} [dim]({self.current_step})[/dim]",
+                markup=True,
+            )
+            self._push_event(
+                f"[dim]model: {escape(self.current_model)} (source: {escape(model_source)})[/dim]",
                 markup=True,
             )
             return
@@ -732,26 +812,41 @@ class TasksUI(App):
             if ev_type == "step_start":
                 self._push_event("[green]- step start -[/green]", markup=True)
             elif ev_type == "step_finish":
-                self._push_event("[green]- step finish -[/green]", markup=True)
+                part = ev.get("part") or {}
+                reason = str(part.get("reason") or "unknown")
+                tokens = part.get("tokens")
+                suffix = f" | {_token_summary(tokens)}" if tokens else ""
+                self._push_event(
+                    f"[green]- step finish -[/green] [dim]reason: {escape(reason)}{escape(suffix)}[/dim]",
+                    markup=True,
+                )
             elif ev_type == "text":
                 part = ev.get("part") or {}
                 txt = str(part.get("text") or "").strip()
                 if txt:
-                    for chunk in txt.splitlines():
-                        c = chunk.strip()
-                        if c:
-                            self._push_event(f"[blue]LLM[/blue] {escape(c)}", markup=True)
+                    self._push_event(f"[blue]LLM[/blue]\n{escape(_event_text(txt))}", markup=True)
             elif ev_type == "tool_use":
                 part = ev.get("part") or {}
                 tool = str(part.get("tool") or "tool")
                 state = part.get("state") or {}
                 st = str(state.get("status") or "unknown")
                 self._push_event(f"[yellow]TOOL[/yellow] {escape(tool)} [dim]({escape(st)})[/dim]", markup=True)
+                tool_input = state.get("input")
+                if tool_input not in (None, {}, []):
+                    self._push_event(f"[dim]↳ {escape(_tool_preview(tool_input))}[/dim]", markup=True)
                 out = state.get("output")
-                if isinstance(out, str) and out.strip():
-                    first = next((ln.strip() for ln in out.splitlines() if ln.strip()), "")
-                    if first:
-                        self._push_event(f"[dim]↳ {escape(first[:240])}[/dim]", markup=True)
+                if out not in (None, "", {}, []):
+                    self._push_event(f"[dim]↰ {escape(_tool_preview(out))}[/dim]", markup=True)
+                tool_error = state.get("error")
+                if tool_error:
+                    self._push_event(f"[red]tool error:\n{escape(_event_text(tool_error))}[/red]", markup=True)
+            elif ev_type == "error":
+                self._push_event(f"[bold red]OPENCODE ERROR[/bold red]\n{escape(_opencode_error_text(ev))}", markup=True)
+            else:
+                self._push_event(
+                    f"[magenta]{escape(ev_type)}[/magenta] [dim]{escape(_tool_preview(ev))}[/dim]",
+                    markup=True,
+                )
             return
 
         if kind == "run_done":
@@ -859,12 +954,15 @@ class TasksUI(App):
             for step in step_configs:
                 key = step["id"]
                 value = effective_agents[key]
-                model = str(step.get("model") or runner.MODEL or "default")
+                model_override = str(step.get("model") or "").strip()
+                agent_model = runner.agent_configured_model(value)
+                model = model_override or agent_model or "OpenCode default"
+                model_source = "step override" if model_override else ("agent" if agent_model else "OpenCode")
                 active_marker = "" if run_steps is None or key in run_step_set else " [dim](skipped)[/dim]"
                 agents_lines.append(
                     f"[#6dd3ff]{escape(step['label'])}[/#6dd3ff] "
                     f"[dim]({escape(key)})[/dim]: [#ffcc8a]{escape(value)}[/#ffcc8a] "
-                    f"[dim]model {escape(model)}[/dim]{active_marker}"
+                    f"[dim]model {escape(model)} ({escape(model_source)})[/dim]{active_marker}"
                 )
         except ValueError as exc:
             agents_lines.append(f"[red]{escape(str(exc))}[/red]")

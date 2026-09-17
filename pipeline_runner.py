@@ -56,7 +56,9 @@ DEFAULT_STEP_CONFIGS = [
 SUPPORTED_STEP_IDS = {step["id"] for step in DEFAULT_STEP_CONFIGS}
 STEP_ID_RE = re.compile(r"^[A-Za-z0-9_-]+$")
 
-MODEL: Optional[str] = _require_env("MODEL")
+# Models are normally selected by each OpenCode agent's frontmatter. A model in
+# steps.json is an explicit per-step override; there is no global CLI override.
+MODEL: Optional[str] = None
 VARIANT: Optional[str] = None
 USE_ATTACH = False
 ATTACH_URL = "http://localhost:4096"
@@ -253,6 +255,29 @@ def task_agents(task: Dict[str, Any], step_configs: Optional[List[Dict[str, Any]
     }
 
 
+def agent_configured_model(agent: str, project_dir: Path = PROJECT_DIR) -> Optional[str]:
+    """Best-effort lookup of the model declared in an OpenCode agent file."""
+    candidates = [
+        project_dir / ".opencode" / "agents" / f"{agent}.md",
+        Path.home() / ".config" / "opencode" / "agents" / f"{agent}.md",
+        Path.home() / ".opencode" / "agents" / f"{agent}.md",
+    ]
+    for path in candidates:
+        if not path.is_file():
+            continue
+        try:
+            content = path.read_text(encoding="utf-8")
+        except OSError:
+            continue
+        frontmatter = content.split("---", 2)
+        if len(frontmatter) < 3:
+            continue
+        match = re.search(r"(?m)^model\s*:\s*['\"]?([^'\"\s#]+)", frontmatter[1])
+        if match:
+            return match.group(1).strip()
+    return None
+
+
 def task_run_step_ids(task: Dict[str, Any]) -> Optional[List[str]]:
     raw_steps = task.get("run_steps")
     if raw_steps is None:
@@ -318,13 +343,20 @@ def require_exists(p: Path, err_msg: str) -> None:
         raise FileNotFoundError(f"{err_msg}: {p}")
 
 
-def build_cmd_base(files: List[Path], model: Optional[str] = None) -> List[str]:
-    cmd = ["opencode", "run", "--format", "json"]
-    effective_model = model or MODEL
+def build_cmd_base(
+    files: List[Path],
+    model: Optional[str] = None,
+    cwd: Optional[Path] = None,
+) -> List[str]:
+    cmd = ["opencode", "run", "--format", "json", "--print-logs", "--log-level", "ERROR"]
+    if cwd:
+        # OpenCode may use the inherited PWD instead of the subprocess cwd when
+        # resolving the project. Be explicit so sessions belong to PROJECT_DIR.
+        cmd += ["--dir", str(cwd)]
     if USE_ATTACH:
         cmd += ["--attach", ATTACH_URL]
-    if effective_model:
-        cmd += ["--model", effective_model]
+    if model:
+        cmd += ["--model", model]
     if VARIANT:
         cmd += ["--variant", VARIANT]
     if SHARE_SESSION:
@@ -360,6 +392,35 @@ def parse_session_id_from_json_events(output: str) -> Optional[str]:
             sid = meta.get("sessionID") or meta.get("sessionId") or meta.get("session_id") or meta.get("id")
             if isinstance(sid, str) and sid:
                 return sid
+    return None
+
+
+def parse_opencode_error_from_json_events(output: str) -> Optional[str]:
+    """Return the most useful error reported by OpenCode's JSON event stream."""
+    for line in reversed(output.splitlines()):
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            event = json.loads(line)
+        except Exception:
+            continue
+        if event.get("type") != "error":
+            continue
+
+        error = event.get("error")
+        if not isinstance(error, dict):
+            return str(error or "Unknown OpenCode error")
+        data = error.get("data")
+        data = data if isinstance(data, dict) else {}
+        name = str(error.get("name") or "OpenCode error")
+        message = str(data.get("message") or error.get("message") or "").strip()
+        reference = str(data.get("ref") or error.get("ref") or "").strip()
+
+        details = f"{name}: {message}" if message else name
+        if reference:
+            details += f" (ref: {reference})"
+        return details
     return None
 
 
@@ -424,12 +485,16 @@ def build_pipeline_steps(
     for step in step_configs:
         step_id = step["id"]
         output_file = step_output_file(step_id, task_dir)
+        model_override = str(step.get("model") or "").strip() or None
+        configured_model = agent_configured_model(agents[step_id])
         steps.append(
             {
                 "id": step_id,
                 "label": step["label"],
                 "agent": agents[step_id],
-                "model": step.get("model") or MODEL,
+                "model": model_override,
+                "display_model": model_override or configured_model or "OpenCode default",
+                "model_source": "step override" if model_override else ("agent" if configured_model else "OpenCode"),
                 "input_file": input_file,
                 "output_file": output_file,
                 "message": step_message(step_id, step["label"], output_file),
@@ -452,7 +517,7 @@ def run_opencode_step_stream(
     title: Optional[str] = None,
     session_id: Optional[str] = None,
 ) -> Tuple[int, str, Optional[str]]:
-    cmd = build_cmd_base(files, model=model) + ["--agent", agent]
+    cmd = build_cmd_base(files, model=model, cwd=cwd) + ["--agent", agent]
     if title:
         cmd += ["--title", title]
     if session_id:
@@ -466,6 +531,7 @@ def run_opencode_step_stream(
     proc = subprocess.Popen(
         cmd,
         cwd=str(cwd),
+        env={**os.environ, "PWD": str(cwd)},
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,
@@ -554,7 +620,7 @@ def run_selected_task(
         {
             "kind": "run_start",
             "task_id": selected_id,
-            "model": MODEL,
+            "model": "per-agent",
             "steps_total": len(steps),
             "run_mode": run_mode,
             "log_path": str(log_path),
@@ -590,7 +656,7 @@ def run_selected_task(
         input_file: Path = step["input_file"]
         output_file: Path = step["output_file"]
         agent = str(step["agent"])
-        model = str(step.get("model") or MODEL or "")
+        model = str(step.get("model") or "")
 
         emit(
             callback,
@@ -599,7 +665,8 @@ def run_selected_task(
                 "index": step_index,
                 "label": label,
                 "agent": agent,
-                "model": model,
+                "model": str(step.get("display_model") or "OpenCode default"),
+                "model_source": str(step.get("model_source") or "OpenCode"),
                 "total": len(steps),
             },
         )
@@ -609,7 +676,7 @@ def run_selected_task(
             emit(callback, {"kind": "error", "text": f"Missing input file: {input_file}"})
             break
 
-        rc, _out, sid = run_opencode_step_stream(
+        rc, step_output, sid = run_opencode_step_stream(
             agent=agent,
             model=model,
             message=str(step["message"]),
@@ -623,18 +690,19 @@ def run_selected_task(
         )
         session_id = sid or session_id
 
-        if rc != 0 or not output_file.exists():
+        provider_error = parse_opencode_error_from_json_events(step_output)
+        if rc != 0 or provider_error or not output_file.exists():
             ok = False
             if control and control.stop_requested:
                 emit(callback, {"kind": "error", "text": "Run stopped by user"})
                 break
-            emit(
-                callback,
-                {
-                    "kind": "error",
-                    "text": f"Step '{label}' failed or output not found: {output_file.name}",
-                },
-            )
+            if provider_error:
+                error_text = f"Step '{label}' failed: {provider_error}"
+            elif rc != 0:
+                error_text = f"Step '{label}' failed: OpenCode exited with code {rc}"
+            else:
+                error_text = f"Step '{label}' completed but did not create {output_file}"
+            emit(callback, {"kind": "error", "text": error_text})
             break
 
         emit(
