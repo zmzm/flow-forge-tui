@@ -1,4 +1,5 @@
 .env
+.env.local
 .venv
 runs
 tasks.jsonl

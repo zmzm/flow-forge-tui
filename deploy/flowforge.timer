@@ -1,0 +1,22 @@
+# FlowForge headless worker — systemd timer example.
+#
+# Install (after installing flowforge.service):
+#   sudo cp deploy/flowforge.timer /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now flowforge.timer
+#
+# Inspect:
+#   systemctl list-timers flowforge.timer
+#   systemctl status flowforge.timer
+#   journalctl -u flowforge.service -f
+
+[Unit]
+Description=Run the FlowForge worker daily at 03:00
+
+[Timer]
+OnCalendar=*-*-* 03:00:00
+# Run the job after boot if it was missed while the machine was off.
+Persistent=true
+
+[Install]
+WantedBy=timers.target

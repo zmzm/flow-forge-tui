@@ -343,12 +343,19 @@ def require_exists(p: Path, err_msg: str) -> None:
         raise FileNotFoundError(f"{err_msg}: {p}")
 
 
+def opencode_bin() -> str:
+    bin_path = os.getenv("OPENCODE_BIN", "").strip() or "opencode"
+    if "/" in bin_path:
+        bin_path = str(Path(bin_path).expanduser().resolve())
+    return bin_path
+
+
 def build_cmd_base(
     files: List[Path],
     model: Optional[str] = None,
     cwd: Optional[Path] = None,
 ) -> List[str]:
-    cmd = ["opencode", "run", "--format", "json", "--print-logs", "--log-level", "ERROR"]
+    cmd = [opencode_bin(), "run", "--format", "json", "--print-logs", "--log-level", "ERROR"]
     if cwd:
         # OpenCode may use the inherited PWD instead of the subprocess cwd when
         # resolving the project. Be explicit so sessions belong to PROJECT_DIR.

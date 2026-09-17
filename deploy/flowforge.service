@@ -1,0 +1,28 @@
+# FlowForge headless worker — systemd service example (system-level unit).
+#
+# Install:
+#   1. Copy to /etc/systemd/system/flowforge.service
+#   2. Replace YOUR_USER and every /opt/flow-forge-tui with your install paths
+#   3. Make sure /opt/flow-forge-tui/.env exists (see .env.example) and is
+#      readable only by the service user: chmod 600 /opt/flow-forge-tui/.env
+#   4. sudo systemctl daemon-reload
+#
+# systemd does NOT execute ~/.bashrc or ~/.profile. If opencode is installed
+# under ~/.local/bin, set OPENCODE_BIN=/home/YOUR_USER/.local/bin/opencode
+# in the .env file so FlowForge uses a deterministic executable path.
+
+[Unit]
+Description=FlowForge autonomous coding worker
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=YOUR_USER
+Group=YOUR_USER
+WorkingDirectory=/opt/flow-forge-tui
+EnvironmentFile=/opt/flow-forge-tui/.env
+Environment=PATH=/usr/local/bin:/usr/bin:/bin
+# A scheduled batch may legitimately run for hours; never time it out.
+TimeoutStartSec=0
+ExecStart=/usr/bin/python3 /opt/flow-forge-tui/run-task.py

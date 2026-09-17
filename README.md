@@ -27,7 +27,15 @@ This tool is useful when you have a long JSON task list and want to:
   - headless execution engine;
   - runs steps, streams events, writes logs, and updates `tasks.jsonl`.
 - `run-task.py`
-  - thin CLI wrapper over `pipeline_runner.py`.
+  - thin CLI wrapper: single task or scheduled batch, exit codes, locking.
+- `headless_runner.py`
+  - batch loop, batch limits (`FLOWFORGE_*` env), single-instance lock,
+    lifecycle logging, notification dispatch.
+- `notifications/`
+  - generic notifier interface (`base.py`) and the Matrix implementation
+    (`matrix.py`); disabled by default (`MATRIX_ENABLED=false`).
+- `deploy/`
+  - example systemd service + timer for autonomous server runs.
 
 ## Requirements
 
@@ -87,6 +95,14 @@ Run a specific task:
 
 ```bash
 python3 run-task.py --task-id f2-d8
+```
+
+The CLI can also process several queued tasks per invocation and send Matrix
+notifications — see [docs/headless-server.md](docs/headless-server.md) for the
+headless-server setup (batch limits, locking, systemd timer, Matrix).
+
+```bash
+python3 run-task.py --max-tasks 3
 ```
 
 ## Task Format (`tasks.jsonl`)
