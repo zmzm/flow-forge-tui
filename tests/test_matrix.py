@@ -155,6 +155,7 @@ class MatrixHttpTests(unittest.TestCase):
             "https://matrix.example.com/_matrix/client/v3/rooms/%21room%3Aexample.com/send/m.room.message/m"
         ))
         self.assertEqual(request.headers.get("Authorization"), "Bearer secret-token")
+        self.assertEqual(request.headers.get("User-agent"), "FlowForge/1.0")
         payload = json.loads(request.data.decode("utf-8"))
         self.assertEqual(payload["msgtype"], "m.text")
         self.assertIn("f2-d8", payload["body"])

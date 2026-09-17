@@ -6,20 +6,22 @@ Adds batch limits, single-instance locking, lifecycle logging, and notifications
 
 from __future__ import annotations
 
-import fcntl
 import logging
 import os
 import time
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Callable, Dict, IO, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 import pipeline_runner as pr
 from notifications import Notifier
 from notifications.base import parse_bool
 
 logger = logging.getLogger("flowforge.runner")
+
+acquire_lock = pr.acquire_lock
+release_lock = pr.release_lock
 
 DEFAULT_MAX_TASKS_PER_RUN = 1
 DEFAULT_STOP_ON_FAILURE = True
@@ -104,29 +106,6 @@ def batch_config_from_env(
     )
 
 
-def acquire_lock(path: Path) -> Optional[IO[str]]:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    handle = open(path, "w", encoding="utf-8")
-    try:
-        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except OSError:
-        handle.close()
-        logger.warning("Lock %s is held by another FlowForge process", path)
-        return None
-    handle.write(f"{os.getpid()}\n")
-    handle.flush()
-    return handle
-
-
-def release_lock(handle: IO[str]) -> None:
-    try:
-        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
-    except OSError:
-        pass
-    finally:
-        handle.close()
-
-
 def task_title(task: Dict[str, Any], project_dir: Path) -> Optional[str]:
     """Best-effort task title: first Markdown heading of the task file."""
     raw = task.get("task_file")
@@ -196,13 +175,24 @@ def run_batch(
     run_task: Optional[Callable[..., pr.RunResult]] = None,
     clock: Callable[[], float] = time.monotonic,
 ) -> BatchOutcome:
-    """Process queued tasks. With task_id set, runs exactly that one task."""
+    """Process queued tasks. With task_id set, runs exactly that one task.
+
+    Must run while holding the runs/.flowforge.lock flock (run-task.py does):
+    it converts stale 'running' tasks (dead-process leftovers) to 'failed'.
+    """
     run_one = run_task or pr.run_selected_task
     single = task_id is not None
     started = clock()
     outcomes: List[TaskOutcome] = []
     reason = "queue_empty"
     processed = 0
+
+    try:
+        recovered = pr.recover_stale_running_tasks(pr.TASKS_FILE)
+    except (FileNotFoundError, ValueError) as exc:
+        raise ValueError(f"Cannot read tasks file {pr.TASKS_FILE}: {exc}") from exc
+    if recovered:
+        logger.info("Recovered stale running tasks (marked failed): %s", ", ".join(recovered))
 
     while True:
         if single:
@@ -282,10 +272,11 @@ def run_batch(
                 message = f"{type(failure).__name__}: {failure}"
                 log_path = tracker.log_path
             logger.error("Task %s failed: %s", selected_id, message[:LOG_TEXT_LIMIT])
+            stage = result.stage if (result is not None and result.stage) else tracker.stage
             notifier.task_failed(
                 {"id": selected_id, "title": title},
                 {
-                    "stage": tracker.stage,
+                    "stage": stage,
                     "message": tracker.error or message,
                     "duration_sec": duration,
                     "log_path": log_path,

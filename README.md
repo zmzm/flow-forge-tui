@@ -159,18 +159,23 @@ The global config editor (`g`) opens the current `steps.json` prefilled and can 
 
 ## What Gets Updated After a Run
 
+While a task executes it is marked `status: running` (visible in the TUI).
+
 On success:
 - `status: done`
 - `session_id`
 - `last_run_log`
 - `outputs` (paths to produced files)
 
-On failure or manual stop:
+On failure, manual stop, timeout, or a crashed runner:
 - `status: failed`
 - `session_id` (if already available)
 - `last_run_log`
 
-Step logs are written to the `runs/` directory.
+If the runner dies mid-task, the task stays `running`; the next headless run
+marks it `failed` and it auto-resumes from the first missing step output.
+Step logs are written to the `runs/` directory. `tasks.jsonl` is rewritten
+atomically, so a crash can never corrupt the queue.
 
 ## Main Features
 

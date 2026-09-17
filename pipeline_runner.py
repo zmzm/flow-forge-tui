@@ -6,6 +6,7 @@ Contains task selection, pipeline execution, and tasks.jsonl updates.
 
 from __future__ import annotations
 
+import fcntl
 import json
 import os
 import re
@@ -14,7 +15,7 @@ import threading
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, IO, List, Optional, Tuple
 
 
 def _load_dotenv_if_present(dotenv_path: Path) -> None:
@@ -43,10 +44,21 @@ def _require_env(name: str) -> str:
     return value
 
 
+def _optional_int_env(name: str, default: Optional[int]) -> Optional[int]:
+    raw = os.getenv(name, "").strip()
+    if not raw:
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        raise RuntimeError(f"{name} must be an integer, got: {raw!r}") from None
+    return value if value > 0 else None
+
+
 PROJECT_DIR = Path(_require_env("PROJECT_DIR")).expanduser()
 TASKS_FILE = Path(_require_env("TASKS_FILE")).expanduser()
 STEPS_FILE = TASKS_FILE.with_name("steps.json")
-RUNS_DIR = Path("runs").expanduser()
+RUNS_DIR = Path(os.getenv("FLOWFORGE_RUNS_DIR", "runs")).expanduser()
 
 DEFAULT_STEP_CONFIGS = [
     {"id": "concept", "label": "Business plan", "agent": "concept-plan"},
@@ -62,7 +74,7 @@ MODEL: Optional[str] = None
 VARIANT: Optional[str] = None
 USE_ATTACH = False
 ATTACH_URL = "http://localhost:4096"
-STEP_TIMEOUT_SEC: Optional[int] = None
+STEP_TIMEOUT_SEC: Optional[int] = _optional_int_env("FLOWFORGE_STEP_TIMEOUT_SECONDS", 3600)
 SHARE_SESSION = False
 
 EventCallback = Optional[Callable[[Dict[str, Any]], None]]
@@ -75,6 +87,7 @@ class RunResult:
     session_id: Optional[str]
     log_path: Optional[Path]
     message: str
+    stage: Optional[str] = None
 
 
 class RunControl:
@@ -115,10 +128,73 @@ def read_tasks_jsonl(path: Path) -> List[Dict[str, Any]]:
 
 
 def write_tasks_jsonl(path: Path, tasks: List[Dict[str, Any]]) -> None:
-    path.write_text(
-        "\n".join(json.dumps(t, ensure_ascii=False) for t in tasks) + "\n",
-        encoding="utf-8",
-    )
+    data = "\n".join(json.dumps(t, ensure_ascii=False) for t in tasks) + "\n"
+    tmp_path = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+    try:
+        with tmp_path.open("w", encoding="utf-8") as fh:
+            fh.write(data)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp_path, path)
+    finally:
+        if tmp_path.exists():
+            try:
+                tmp_path.unlink()
+            except OSError:
+                pass
+
+
+def _persist_task_update(path: Path, idx: int, task_id: str, updates: Dict[str, Any]) -> None:
+    """Merge a task's field updates into a freshly read tasks.jsonl (atomic)."""
+    tasks = read_tasks_jsonl(path)
+    pos = find_task_index(tasks, task_id)
+    if pos is None and 0 <= idx < len(tasks):
+        pos = idx
+    if pos is None:
+        tasks.append({"id": task_id, **updates})
+    else:
+        tasks[pos].update(updates)
+    write_tasks_jsonl(path, tasks)
+
+
+def recover_stale_running_tasks(path: Path) -> List[str]:
+    """Mark 'running' tasks (left over from a dead process) as failed so they auto-resume."""
+    try:
+        tasks = read_tasks_jsonl(path)
+    except (FileNotFoundError, ValueError):
+        return []
+    recovered: List[str] = []
+    changed = False
+    for task in tasks:
+        if str(task.get("status", "")) == "running":
+            task["status"] = "failed"
+            recovered.append(str(task.get("id") or "-"))
+            changed = True
+    if changed:
+        write_tasks_jsonl(path, tasks)
+    return recovered
+
+
+def acquire_lock(path: Path) -> Optional[IO[str]]:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    handle = open(path, "w", encoding="utf-8")
+    try:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        handle.close()
+        return None
+    handle.write(f"{os.getpid()}\n")
+    handle.flush()
+    return handle
+
+
+def release_lock(handle: IO[str]) -> None:
+    try:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+    except OSError:
+        pass
+    finally:
+        handle.close()
 
 
 def normalize_step_configs(raw_steps: Any, source: str = "steps config") -> List[Dict[str, Any]]:
@@ -523,7 +599,7 @@ def run_opencode_step_stream(
     control: Optional[RunControl] = None,
     title: Optional[str] = None,
     session_id: Optional[str] = None,
-) -> Tuple[int, str, Optional[str]]:
+) -> Tuple[int, str, Optional[str], bool]:
     cmd = build_cmd_base(files, model=model, cwd=cwd) + ["--agent", agent]
     if title:
         cmd += ["--title", title]
@@ -548,39 +624,62 @@ def run_opencode_step_stream(
     if control:
         control.set_active_proc(proc)
 
+    timed_out = False
+
+    def _expire() -> None:
+        nonlocal timed_out
+        timed_out = True
+        proc.terminate()
+        kill_timer = threading.Timer(10, lambda: proc.kill() if proc.poll() is None else None)
+        kill_timer.daemon = True
+        kill_timer.start()
+
+    timer = threading.Timer(STEP_TIMEOUT_SEC, _expire) if STEP_TIMEOUT_SEC else None
+    if timer:
+        timer.daemon = True
+        timer.start()
+
     raw: List[str] = []
     sess: Optional[str] = session_id
     assert proc.stdout is not None
-    for line in proc.stdout:
-        if control and control.stop_requested and proc.poll() is None:
+    try:
+        for line in proc.stdout:
+            if control and control.stop_requested and proc.poll() is None:
+                try:
+                    proc.terminate()
+                except Exception:
+                    pass
+
+            line = line.rstrip("\n")
+            raw.append(line)
+            if not line.strip():
+                continue
             try:
-                proc.terminate()
+                ev = json.loads(line)
+                emit(callback, {"kind": "opencode_event", "event": ev})
+                if sess is None:
+                    sess = ev.get("sessionID") or ev.get("sessionId") or ev.get("session_id")
+                    if sess:
+                        emit(callback, {"kind": "session", "session_id": sess})
             except Exception:
-                pass
-
-        line = line.rstrip("\n")
-        raw.append(line)
-        if not line.strip():
-            continue
-        try:
-            ev = json.loads(line)
-            emit(callback, {"kind": "opencode_event", "event": ev})
-            if sess is None:
-                sess = ev.get("sessionID") or ev.get("sessionId") or ev.get("session_id")
-                if sess:
-                    emit(callback, {"kind": "session", "session_id": sess})
-        except Exception:
-            emit(callback, {"kind": "line", "text": line})
-
-    rc = proc.wait(timeout=STEP_TIMEOUT_SEC) if STEP_TIMEOUT_SEC else proc.wait()
+                emit(callback, {"kind": "line", "text": line})
+    finally:
+        if timer:
+            timer.cancel()
     if control:
         control.set_active_proc(None)
     out_all = "\n".join(raw) + "\n"
     with log_path.open("a", encoding="utf-8") as f:
         f.write(out_all)
 
+    try:
+        rc = proc.wait(timeout=10)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        rc = proc.wait()
+
     sid = parse_session_id_from_json_events(out_all) or sess
-    return rc, out_all, sid
+    return rc, out_all, sid, timed_out
 
 
 def run_selected_task(
@@ -621,6 +720,10 @@ def run_selected_task(
     log_path = RUNS_DIR / f"{run_id}.log"
     title = f"{selected_id}: {task_file.name}"
     session_id: Optional[str] = None
+    failed_stage: Optional[str] = None
+
+    task["status"] = "running"
+    _persist_task_update(TASKS_FILE, idx, selected_id, {"status": "running"})
 
     emit(
         callback,
@@ -641,98 +744,119 @@ def run_selected_task(
                 f"Task {selected_id} already has outputs for all configured steps; nothing to run.\n",
                 encoding="utf-8",
             )
-            task["status"] = "done"
-            task["last_run_log"] = str(log_path)
-            task["outputs"] = {str(step["id"]): str(step["output_file"]) for step in all_steps}
-            tasks[idx] = task
-            write_tasks_jsonl(TASKS_FILE, tasks)
+            _persist_task_update(
+                TASKS_FILE,
+                idx,
+                selected_id,
+                {
+                    "status": "done",
+                    "last_run_log": str(log_path),
+                    "outputs": {str(step["id"]): str(step["output_file"]) for step in all_steps},
+                },
+            )
             emit(callback, {"kind": "run_done", "ok": True, "task_id": selected_id, "session_id": session_id})
             return RunResult(True, selected_id, session_id, log_path, f"Task {selected_id} -> already complete")
         ok = False
         emit(callback, {"kind": "error", "text": "No steps selected"})
 
-    for step_index, step in enumerate(steps):
-        if not ok:
-            break
-        if control and control.stop_requested:
-            ok = False
-            emit(callback, {"kind": "error", "text": "Run stopped by user"})
-            break
-
-        label = str(step["label"])
-        input_file: Path = step["input_file"]
-        output_file: Path = step["output_file"]
-        agent = str(step["agent"])
-        model = str(step.get("model") or "")
-
-        emit(
-            callback,
-            {
-                "kind": "step_start",
-                "index": step_index,
-                "label": label,
-                "agent": agent,
-                "model": str(step.get("display_model") or "OpenCode default"),
-                "model_source": str(step.get("model_source") or "OpenCode"),
-                "total": len(steps),
-            },
-        )
-
-        if not input_file.exists():
-            ok = False
-            emit(callback, {"kind": "error", "text": f"Missing input file: {input_file}"})
-            break
-
-        rc, step_output, sid = run_opencode_step_stream(
-            agent=agent,
-            model=model,
-            message=str(step["message"]),
-            files=[input_file],
-            cwd=PROJECT_DIR,
-            log_path=log_path,
-            callback=callback,
-            control=control,
-            title=title if step_index == 0 else None,
-            session_id=session_id,
-        )
-        session_id = sid or session_id
-
-        provider_error = parse_opencode_error_from_json_events(step_output)
-        if rc != 0 or provider_error or not output_file.exists():
-            ok = False
+    try:
+        for step_index, step in enumerate(steps):
+            if not ok:
+                break
             if control and control.stop_requested:
+                ok = False
                 emit(callback, {"kind": "error", "text": "Run stopped by user"})
                 break
-            if provider_error:
-                error_text = f"Step '{label}' failed: {provider_error}"
-            elif rc != 0:
-                error_text = f"Step '{label}' failed: OpenCode exited with code {rc}"
-            else:
-                error_text = f"Step '{label}' completed but did not create {output_file}"
-            emit(callback, {"kind": "error", "text": error_text})
-            break
 
-        emit(
-            callback,
-            {"kind": "step_done", "index": step_index, "label": label, "output_file": str(output_file)},
+            label = str(step["label"])
+            failed_stage = label
+            input_file: Path = step["input_file"]
+            output_file: Path = step["output_file"]
+            agent = str(step["agent"])
+            model = str(step.get("model") or "")
+
+            emit(
+                callback,
+                {
+                    "kind": "step_start",
+                    "index": step_index,
+                    "label": label,
+                    "agent": agent,
+                    "model": str(step.get("display_model") or "OpenCode default"),
+                    "model_source": str(step.get("model_source") or "OpenCode"),
+                    "total": len(steps),
+                },
+            )
+
+            if not input_file.exists():
+                ok = False
+                emit(callback, {"kind": "error", "text": f"Missing input file: {input_file}"})
+                break
+
+            rc, step_output, sid, step_timed_out = run_opencode_step_stream(
+                agent=agent,
+                model=model,
+                message=str(step["message"]),
+                files=[input_file],
+                cwd=PROJECT_DIR,
+                log_path=log_path,
+                callback=callback,
+                control=control,
+                title=title if step_index == 0 else None,
+                session_id=session_id,
+            )
+            session_id = sid or session_id
+
+            provider_error = parse_opencode_error_from_json_events(step_output)
+            if rc != 0 or provider_error or not output_file.exists():
+                ok = False
+                if control and control.stop_requested:
+                    emit(callback, {"kind": "error", "text": "Run stopped by user"})
+                    break
+                if step_timed_out:
+                    error_text = f"Step '{label}' timed out after {STEP_TIMEOUT_SEC}s and was terminated"
+                elif provider_error:
+                    error_text = f"Step '{label}' failed: {provider_error}"
+                elif rc != 0:
+                    error_text = f"Step '{label}' failed: OpenCode exited with code {rc}"
+                else:
+                    error_text = f"Step '{label}' completed but did not create {output_file}"
+                emit(callback, {"kind": "error", "text": error_text})
+                break
+
+            failed_stage = None
+            emit(
+                callback,
+                {"kind": "step_done", "index": step_index, "label": label, "output_file": str(output_file)},
+            )
+    except BaseException:
+        _persist_task_update(
+            TASKS_FILE,
+            idx,
+            selected_id,
+            {"status": "failed", "last_run_log": str(log_path), "session_id": session_id},
         )
+        raise
 
     if not ok:
-        task.update({"status": "failed", "last_run_log": str(log_path), "session_id": session_id})
-        tasks[idx] = task
-        write_tasks_jsonl(TASKS_FILE, tasks)
+        _persist_task_update(
+            TASKS_FILE,
+            idx,
+            selected_id,
+            {"status": "failed", "last_run_log": str(log_path), "session_id": session_id},
+        )
         emit(callback, {"kind": "run_done", "ok": False, "task_id": selected_id, "session_id": session_id})
         if control and control.stop_requested:
-            return RunResult(False, selected_id, session_id, log_path, f"Task {selected_id} -> stopped")
-        return RunResult(False, selected_id, session_id, log_path, f"Task {selected_id} -> failed")
+            return RunResult(False, selected_id, session_id, log_path, f"Task {selected_id} -> stopped", failed_stage)
+        return RunResult(False, selected_id, session_id, log_path, f"Task {selected_id} -> failed", failed_stage)
 
-    task["status"] = "done"
-    task["session_id"] = session_id
-    task["last_run_log"] = str(log_path)
     outputs = task.get("outputs") if isinstance(task.get("outputs"), dict) else {}
     outputs.update({str(step["id"]): str(step["output_file"]) for step in steps})
-    task["outputs"] = outputs
-    tasks[idx] = task
-    write_tasks_jsonl(TASKS_FILE, tasks)
+    _persist_task_update(
+        TASKS_FILE,
+        idx,
+        selected_id,
+        {"status": "done", "session_id": session_id, "last_run_log": str(log_path), "outputs": outputs},
+    )
     emit(callback, {"kind": "run_done", "ok": True, "task_id": selected_id, "session_id": session_id})
     return RunResult(True, selected_id, session_id, log_path, f"Task {selected_id} -> done")

@@ -59,6 +59,8 @@ Required: `PROJECT_DIR` and `TASKS_FILE` (same values the TUI uses).
 | `FLOWFORGE_MAX_TASKS_PER_RUN` | `1` | Max tasks processed per invocation (`1` = legacy single-task behavior) |
 | `FLOWFORGE_STOP_ON_FAILURE` | `true` | Stop the batch when a task fails; `false` = record and continue |
 | `FLOWFORGE_MAX_RUNTIME_SECONDS` | `14400` | Do not *start* another task after this many seconds; `0` = unlimited. A running task is never killed because of this limit |
+| `FLOWFORGE_STEP_TIMEOUT_SECONDS` | `3600` | Kill a single hung OpenCode step (SIGTERM, then SIGKILL after 10s) and mark the task failed; `0` = unlimited |
+| `FLOWFORGE_RUNS_DIR` | `runs` | Directory for run logs and the lock file (relative to the working directory unless absolute) |
 | `OPENCODE_BIN` | `opencode` | Explicit path to the opencode executable |
 | `MATRIX_ENABLED` | `false` | Enable Matrix notifications |
 | `MATRIX_HOMESERVER` / `MATRIX_ROOM_ID` / `MATRIX_ACCESS_TOKEN` | — | Matrix settings (required when enabled) |
@@ -175,10 +177,27 @@ sudo systemctl disable --now flowforge.timer
 ## Concurrency (single-instance lock)
 
 Before doing any work, `run-task.py` takes an exclusive `flock` on
-`runs/.flowforge.lock` (created automatically). If another FlowForge process
-holds it, the new invocation logs a warning and exits 0 without touching the
-queue — two workers can never select the same `todo` task. The lock is released
-automatically when the process exits, even after a crash.
+`runs/.flowforge.lock` (created automatically; location follows
+`FLOWFORGE_RUNS_DIR`). If another FlowForge process holds it, the new
+invocation logs a warning and exits 0 without touching the queue — two workers
+can never select the same `todo` task. The lock is released automatically when
+the process exits, even after a crash. The TUI takes the same lock while one of
+its runs is in flight, so a UI run and a scheduled run also cannot overlap.
+
+Additional safety nets:
+
+- `tasks.jsonl` is rewritten atomically (temp file + `os.replace`), so a crash
+  or power loss can never leave a half-written queue. Final status updates are
+  merged into a freshly re-read file, so edits made while a task was running
+  are not clobbered.
+- While a task executes it is marked `running` in `tasks.jsonl`. If the
+  process dies, the next headless run converts stale `running` tasks to
+  `failed` (logged), which makes them auto-resume from the first missing step
+  output instead of re-running the whole pipeline.
+- Each OpenCode step is bounded by `FLOWFORGE_STEP_TIMEOUT_SECONDS` (default
+  1h): a hung process gets SIGTERM, then SIGKILL, and the task is marked
+  failed. As an optional hard cap for the whole service you can also set
+  `RuntimeMaxSec=6h` (for example) in `flowforge.service`.
 
 ## Testing this setup
 

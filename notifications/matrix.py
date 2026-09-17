@@ -15,6 +15,7 @@ from .base import Notifier
 DEFAULT_TIMEOUT_SEC = 10.0
 MAX_MESSAGE_CHARS = 2000
 MAX_ERROR_CHARS = 500
+USER_AGENT = "FlowForge/1.0"
 
 
 def format_duration(seconds: float) -> str:
@@ -74,6 +75,7 @@ class MatrixNotifier(Notifier):
             headers={
                 "Content-Type": "application/json",
                 "Authorization": f"Bearer {self.access_token}",
+                "User-Agent": USER_AGENT,
             },
         )
         try:

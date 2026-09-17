@@ -224,6 +224,20 @@ class BatchTests(HeadlessTestCase):
         self.assertEqual(outcome.completed, 1)
         self.assertEqual(outcome.exit_code, hr.EXIT_OK)
 
+    def test_stale_running_recovered_before_selection(self):
+        write_tasks([
+            {"id": "stale", "status": "running", "task_file": "/tmp/stale.md"},
+            make_task("fresh"),
+        ])
+        config = hr.BatchConfig(max_tasks=5, stop_on_failure=True, max_runtime_seconds=0)
+        outcome = hr.run_batch(
+            config, self.notifier, run_task=stateful_run_task(ok_result)
+        )
+        rows = {r["id"]: r["status"] for r in pr.read_tasks_jsonl(pr.TASKS_FILE)}
+        self.assertEqual(rows["stale"], "failed")
+        self.assertEqual([o.task_id for o in outcome.outcomes], ["fresh"])
+        self.assertEqual(outcome.exit_code, hr.EXIT_OK)
+
     def test_null_notifier_works(self):
         write_tasks([make_task("a")])
         config = hr.BatchConfig(max_tasks=1, stop_on_failure=True, max_runtime_seconds=0)

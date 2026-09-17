@@ -20,7 +20,7 @@ from textual.widgets import Button, DataTable, Footer, Header, Input, RichLog, S
 
 
 TASKS_FILE = runner.TASKS_FILE
-FILTERS = ["all", "todo", "failed", "done"]
+FILTERS = ["all", "todo", "running", "failed", "done"]
 EVENT_TEXT_LIMIT = 2_000
 TOOL_PREVIEW_LIMIT = 400
 HIDDEN_TOOL_FIELDS = {"content", "text", "patch", "oldString", "newString", "old_string", "new_string"}
@@ -125,9 +125,11 @@ def status_color(status: str) -> str:
         return "green"
     if s == "failed":
         return "red"
+    if s == "running":
+        return "cyan"
     if s == "todo":
         return "yellow"
-    return "cyan"
+    return "magenta"
 
 
 class EditTaskScreen(ModalScreen[Optional[Dict[str, Any]]]):
@@ -541,6 +543,7 @@ class TasksUI(App):
         self.runner_active = False
         self.running_task_id: Optional[str] = None
         self.run_control: Optional[runner.RunControl] = None
+        self.run_lock = None
         self.current_model = "per-agent"
         self.current_agent = "-"
         self.current_step = "-"
@@ -618,6 +621,12 @@ class TasksUI(App):
         if self.runner_active:
             self._set_status("Runner is already active")
             return
+
+        lock = runner.acquire_lock(runner.RUNS_DIR / ".flowforge.lock")
+        if lock is None:
+            self._set_status("Another FlowForge process is active; finish it before running here")
+            return
+        self.run_lock = lock
 
         self.runner_active = True
         self.running_task_id = task_id
@@ -730,11 +739,18 @@ class TasksUI(App):
         self._set_status(f"Saved: {task_id}")
 
     def _run_task_thread(self, task_id: str) -> None:
-        result = runner.run_selected_task(
-            task_id=task_id,
-            callback=self._event_from_runner,
-            control=self.run_control,
-        )
+        try:
+            result = runner.run_selected_task(
+                task_id=task_id,
+                callback=self._event_from_runner,
+                control=self.run_control,
+            )
+        except Exception as exc:
+            result = runner.RunResult(False, task_id, None, None, f"Runner error: {exc}")
+        finally:
+            if self.run_lock:
+                runner.release_lock(self.run_lock)
+                self.run_lock = None
 
         def finalize() -> None:
             self.runner_active = False
